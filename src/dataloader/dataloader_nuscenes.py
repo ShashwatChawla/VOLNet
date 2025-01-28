@@ -1,102 +1,148 @@
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import cv2
+
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.data_classes import LidarPointCloud
 
-class NuScenesDataset(Dataset):
-    def __init__(self, nusc, sample_indices):
-        self.nusc = nusc
-        self.sample_indices = sample_indices
+import einops
+import os
+import cv2
+import numpy as np
 
+# NuScenes Camera List:
+# 0: CAM_FRONT
+# 1: CAM_FRONT_LEFT
+# 2: CAM_FRONT_RIGHT
+# 3: CAM_BACK_LEFT
+# 4: CAM_BACK_RIGHT
+# 5: CAM_BACK
+AVAILABLE_CAM_LIST = [0, 1, 2, 3, 4, 5]
+MAX_LIDAR_PTS = 35000
+
+class NuScenesDataset(Dataset):
+    def __init__(self, dataroot, cam_id, mode='mini', seq=0):
+        super(NuScenesDataset, self).__init__()
+
+        if mode == 'mini':
+            dataroot = dataroot + 'mini/'
+        elif mode == 'train':
+            dataroot = dataroot + 'train/'
+        elif mode == 'eval':
+            dataroot = dataroot + 'eval/'
+        
+
+        # TODO: Adapt for multiple sequences
+        self.data_path = os.path.join(dataroot, f"{seq:03d}/")
+        self.timesteps = len(os.listdir(self.data_path + 'lidar_pose'))
+        self.cam_id = cam_id
+
+        self.pairs = self.create_pairs()
+        
+    def create_pairs(self):
+        """
+        Required to load pair of imgs, lidar_pts, poses, extrinsics...
+        """
+        pairs = []
+        
+        for t in range(self.timesteps):
+            if t == (self.timesteps -1):
+                break
+            pair = [t, t + 1]
+            pairs.append(pair)
+        # print(f"Total pairs created: {len(pairs)}")    
+        return pairs
+
+    def get_cam_intrinsics(self):
+        # fx, fy, cx, cy, distortions (0 in the case of nuScenes)
+        return np.loadtxt(os.path.join(self.data_path, "intrinsics/", f"{self.cam_id}.txt"))
+    
     def __len__(self):
-        return len(self.sample_indices)
+        return len(self.pairs)
 
     def __getitem__(self, idx):
-        sample = self.nusc.sample[self.sample_indices[idx]]
+        pairs = self.pairs[idx] # load pairs
         
-        # Get left camera image
-        camera_token = sample['data']['CAM_FRONT_LEFT']
-        image_path = self.nusc.get_sample_data_path(camera_token)
-        image = cv2.imread(image_path)
-        
-        # Get Velodyne LiDAR data
-        lidar_token = sample['data']['LIDAR_TOP']
-        lidar_path = self.nusc.get_sample_data_path(lidar_token)
-        pc = LidarPointCloud.from_file(lidar_path)
-        
-        # Get car pose
-        lidar_data = self.nusc.get('sample_data', lidar_token)
-        ego_pose_token = lidar_data['ego_pose_token']
-        ego_pose = self.nusc.get('ego_pose', ego_pose_token)
-        
+        images = self.load_images(pairs) 
+        lidar_pts = self.load_lidar_pts(pairs)
+        # ego_pose in camera frame
+        cam_pose = self.load_cam_pose(pairs) 
+        # ego_pose in lidar_frame
+        lidar_pose = self.load_lidar_pose(pairs)
+    
         return {
-            'image': image,
-            'lidar_points': pc.points,  # LiDAR points (Nx4) for Velodyne
-            'pose': ego_pose,
+            'images': images, 
+            'cam_pose': cam_pose,
+            'lidar_pose': lidar_pose,
+            'lidar_pts': lidar_pts
         }
-
-
-# Function to pad LiDAR data to the maximum size in the batch
-def pad_lidar_data(lidar_points_list, max_len=None):
-    if max_len is None:
-        max_len = max([pc.shape[1] for pc in lidar_points_list])  # Find the maximum number of points (second dimension)
     
-    # Pad each lidar point cloud to max_len (assuming each point has 4 attributes)
-    padded_lidar = []
-    for pc in lidar_points_list:
-            # Convert numpy array to torch tensor
-            pc_tensor = torch.tensor(pc).float()
-            
-            # Calculate padding size
-            pad_size = max_len - pc_tensor.shape[1]
-            
-            # Pad along the second dimension (number of points), the pad value is 0
-            if pad_size > 0:
-                padded_pc = F.pad(pc_tensor, (0, pad_size), value=0)  # Padding only on the second dimension
-            else:
-                padded_pc = pc_tensor
-            
-            padded_lidar.append(padded_pc)
+    def load_images(self, pairs):
+        images = []
+        for idx in pairs:
+            img = cv2.imread(os.path.join(self.data_path, "images/", f"{idx:03d}_{self.cam_id}.jpg")) 
+            images.append(img)
+        return np.stack(images, axis=0)
     
-    # Stack into a single tensor
-    return torch.stack(padded_lidar)
+    def load_lidar_pts(self, pairs):
+        
+        lidar_pts_all = []
+        for idx in pairs:
+            lidar_filepath = os.path.join(self.data_path, "lidar/", f"{idx:03d}.bin") 
+            lidar_pts = np.fromfile(lidar_filepath, dtype=np.float32).reshape(-1, 4)[:, :3]
+            num_pts = lidar_pts.shape[0]
+
+            # TODO: Replace by padding using a collate_func
+            # Pad with zeros < than MAX_LIDAR_PTS
+            if num_pts < MAX_LIDAR_PTS:
+                pad_size = MAX_LIDAR_PTS - num_pts
+                padding = np.zeros((pad_size, 3), dtype=np.float32)
+                lidar_pts = np.vstack([lidar_pts, padding])  # Pad at the end
+
+            # Truncate if the pts > MAX_LIDAR_PTS (just for safety: always less)
+            elif num_pts > MAX_LIDAR_PTS:
+                print(f"!!!!! Lidar pts greater that max pts :{num_pts} !!!!!!")
+                lidar_pts = lidar_pts[:MAX_LIDAR_PTS, :]  
+                
+            lidar_pts_all.append(lidar_pts)
+        
+        return np.stack(lidar_pts_all, axis=0)
+
+    def load_cam_pose(self, pairs):
+        cam_poses = []
+        for idx in pairs:
+            pose = np.loadtxt(os.path.join(self.data_path, "extrinsics/", f"{idx:03d}_{self.cam_id}.txt"))
+            cam_poses.append(pose)
+
+        return np.stack(cam_poses, axis=0)
+
+    def load_lidar_pose(self, pairs):
+        lidar_poses = []
+        for idx in pairs:
+            pose = np.loadtxt(os.path.join(self.data_path, "lidar_pose/", f"{idx:03d}.txt")) # Only lidar-top
+            lidar_poses.append(pose)
+
+        return np.stack(lidar_poses, axis=0)
 
 
-# Custom collate function for batching with padding
-def collate_fn(batch):
-    images = [item['image'] for item in batch]
-    lidar_points = [item['lidar_points'] for item in batch]
-    car_poses = [item['pose'] for item in batch]
-    
-    # Resize images (optional step, depending on model input size)
-    images = [torch.tensor(cv2.resize(img, (224, 224))).permute(2, 0, 1).float() for img in images]
-    
-    # Pad lidar points to max length in the batch
-    lidar_points = pad_lidar_data(lidar_points)
-    
-    # Convert car poses to tensors (you may need to extract translation/rotation as needed)
-    car_poses = [torch.tensor([ego_pose['translation'] + ego_pose['rotation']]) for ego_pose in car_poses]
-    
-    return {
-        'image': torch.stack(images),
-        'lidar_points': lidar_points,
-        'pose': torch.stack(car_poses)
-    }
 
+# Usage 
+dataroot = '/ocean/projects/cis220039p/shared/nuscenes_full/processed/'
 
-## Usage
+cam_id = 0
+dataset = NuScenesDataset(dataroot, cam_id)
+cam_intrinsics = dataset.get_cam_intrinsics()
 
-# Create the dataset and dataloader
-nusc = NuScenes(version='v1.0-mini', dataroot='/ocean/projects/cis220039p/shared/nuscenes', verbose=True)
-sample_indices = [0, 1, 2, 3, 4]  # Just an example, use your actual sample indices
-dataset = NuScenesDataset(nusc, sample_indices)
+dataloader = DataLoader(dataset, batch_size=5, shuffle=False)
 
-dataloader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn, shuffle=False)
-
-# Test Batch
 for batch in dataloader:
-    print(batch['image'].shape)  # Batch of images (e.g., [batch_size, C, H, W])
-    print(batch['lidar_points'].shape)  # Padded batch of lidar points
-    print(batch['pose'])  
+        print("### Aquired Data ###")
+        print(f"Img Shape :{batch['images'].shape}")
+        print(f"Lidar Shape :{batch['lidar_pts'].shape}")
+        print(f"Cam_pose Shape :{batch['cam_pose'].shape}")
+        print(f"Lidar_pose Shape :{batch['lidar_pose'].shape}")
+
+exit()
+
+
+        
